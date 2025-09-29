@@ -23,7 +23,7 @@ class DbConnector:
         PASSWORD=os.environ.get("DB_PASSWORD"),
     ):
         # Connect to the database
-        try: 
+        try:
             self.db_connection = mysql.connect(
                 host=HOST, database=DATABASE, user=USER, password=PASSWORD, port=3306
             )

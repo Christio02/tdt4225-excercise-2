@@ -1,5 +1,7 @@
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+import folium
 
 import json
 import math
@@ -154,20 +156,30 @@ def count_invalid_trips_single_core(df):
         Number of invalid trips
     """
     polyline_col = df["POLYLINE"]
-    count = 0
+    missing_data_col = df["MISSING_DATA"]
+    missing_data_true_count = 0
+    missing_data_false_count = 0
     total = len(polyline_col)
 
-    for i, polyline_str in enumerate(polyline_col):
+    for i, (polyline_str, missing) in enumerate(zip(polyline_col, missing_data_col)):
         # Progress indicator every 100k rows
         if i % 100000 == 0 and i > 0:
             print(
-                f"  Progress: {i:,}/{total:,} ({i/total*100:.1f}%) - Invalid so far: {count:,}"
+                f"  Progress: {i:,}/{total:,} ({i/total*100:.1f}%) - Invalid so far: {missing_data_true_count + missing_data_false_count :,}"
             )
 
-        if validate_single_polyline(polyline_str, MIN_POLYLINE_POINTS):
-            count += 1
+        is_invalid = validate_single_polyline(polyline_str, MIN_POLYLINE_POINTS)
 
-    return count
+        if is_invalid:
+            if missing:
+                missing_data_true_count += 1
+            else:
+                missing_data_false_count += 1
+
+    return {
+        0: missing_data_true_count,
+        1: missing_data_false_count,
+    }
 
 
 # OLD VERSION (SLOWER) - kept for reference - Very slow!
@@ -200,19 +212,97 @@ def count_invalid_trips_single_core(df):
 # - Invalid trips include: very short trips (<8 points), airport trips, long-distance rides, or GPS errors
 
 
+def plot_trip_lengths(df):
+
+    valid_mask = (
+        pd.notna(df["POLYLINE"])
+        & (df["POLYLINE"] != "[]")
+        & (df["MISSING_DATA"] == False)
+    )
+
+    df["POLYLINE_LENGTH"] = 0
+
+    df.loc[valid_mask, "POLYLINE_LENGTH"] = df.loc[valid_mask, "POLYLINE"].apply(
+        lambda x: len(json.loads(x))
+    )
+    # plt.figure(figsize=(10, 6))
+    # plt.hist(df["POLYLINE_LENGTH"], bins=200, color="black", log=True)
+    # plt.xlabel("Number of GPS points")
+    # plt.ylabel("Frequency")
+    # plt.title("Distribution of trip lengths")
+    # plt.xlim(0, 500)
+    # plt.show()
+    average_length = df["POLYLINE_LENGTH"].mean()
+    median_length = df["POLYLINE_LENGTH"].median()
+    min_length = df["POLYLINE_LENGTH"].min()
+    max_length = df["POLYLINE_LENGTH"].max()
+    std_dev = df["POLYLINE_LENGTH"].std()
+
+    # print(f"Average points per trip: {average_length:.2f}")
+    # print(f"Median points per trip: {median_length}")
+    # print(f"Minimum points per trip: {min_length}")
+    # print(f"Maximum points per trip: {max_length}")
+    # print(f"Standard deviation for trip lengths {std_dev}")
+
+    # print("Looking at longer trips:::")
+    # long_trips = df[df["POLYLINE_LENGTH"] > 100]
+
+    # print(long_trips[["POLYLINE_LENGTH", "MISSING_DATA"]].describe())
+    # print(long_trips.sort_values("POLYLINE_LENGTH", ascending=False).head(10))
+
+    long_trips = df.nlargest(10, "POLYLINE_LENGTH")
+
+    print("Top 10 longest trips:")
+    for index, row in long_trips.iterrows():
+        print(
+            f"Trip {index}: Has {row["POLYLINE_LENGTH"]} points, where the total time is {(row["POLYLINE_LENGTH"] * 15) / 3600} hours"
+        )
+        print("\n")
+    # for index, row in long_trips.iterrows():
+    #     polyline = json.loads(row["POLYLINE"])
+    #     map_obj = plot_trips_map(polyline)
+    #     map_obj.save(f"trip_{index}.html")
+
+
+def plot_trips_map(polyline):
+    m = folium.Map(location=[41.14961, -8.61099], zoom_start=12)
+
+    folium_coords = [[lat, lon] for lon, lat in polyline]
+
+    folium.PolyLine(folium_coords, color="blue", weight=2.5, opacity=1).add_to(m)
+
+    if folium_coords:
+        folium.Marker(
+            folium_coords[0], popup="Start", icon=folium.Icon(color="green")
+        ).add_to(m)
+        folium.Marker(
+            folium_coords[-1], popup="End", icon=folium.Icon(color="red")
+        ).add_to(m)
+
+    return m
+
+
 if __name__ == "__main__":
     df = load_data()
-    print("\n=== Single-core Processing ===")
-    start = time.time()
-    invalid_count = count_invalid_trips_single_core(df)
-    elapsed = time.time() - start
-    print(f"\nFound {invalid_count:,} invalid trips out of {len(df):,} total")
-    print(f"Percentage: {invalid_count/len(df)*100:.2f}%")
-    print(f"Time elapsed: {elapsed:.2f} seconds")
+    # print("\n=== Processing ===")
+    # start = time.time()
+    # invalid_count_dict = count_invalid_trips_single_core(df)
+    # elapsed = time.time() - start
+    # print(
+    #     f"\nFound {invalid_count_dict[0]:,} invalid trips out of {len(df):,} total, where MISSING_DATA = TRUE"
+    # )
+    # print(
+    #     f"\nFound {invalid_count_dict[1]:,} invalid trips out of {len(df):,} total, where MISSING_DATA = FALSE"
+    # )
+    # total_invalid = invalid_count_dict[0] + invalid_count_dict[1]
+    # print(f"Percentage: {total_invalid/len(df)*100:.2f}%")
+    # print(f"Time elapsed: {elapsed:.2f} seconds")
 
-    # Breakdown (optional - for better insight)
-    print("\nBreakdown of invalid reasons:")
-    print("- Empty/null polylines")
-    print("- Polylines with < 8 points")
-    print("- Polylines with out-of-bound coordinates")
-    print("(Note: Some trips may have multiple issues)")
+    # # Breakdown (optional - for better insight)
+    # print("\nBreakdown of invalid reasons:")
+    # print("- Empty/null polylines")
+    # print("- Polylines with < 8 points")
+    # print("- Polylines with out-of-bound coordinates")
+    # print("(Note: Some trips may have multiple issues)")
+
+    plot_trip_lengths(df)
