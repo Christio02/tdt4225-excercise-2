@@ -12,3 +12,6 @@ wheels/
 .venv
 
 dataset
+trajectory_data
+*.pickle
+*.pkl
