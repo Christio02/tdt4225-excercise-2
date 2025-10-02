@@ -1,22 +1,50 @@
+import sqlite3
 import pandas as pd
-##Midlertidig sjekk
-file_path = "../dataset/porto/porto.csv"
 
-df = pd.read_csv(file_path)
+# Sandbox
+clean_file = "../dataset/porto/porto_cleaned.csv"
+db_file = "porto_sandbox.db"
 
-# --- 1. Duplikate TRIP_ID med ulike turer ---
-trip_id_groups = df.groupby("TRIP_ID").nunique()
+print("Loading CSV into SQLite...")
+df = pd.read_csv(clean_file)
 
-problematic_trip_ids = trip_id_groups[trip_id_groups.max(axis=1) > 1]
-print(f"Trip_IDs som peker på flere forskjellige turer: {len(problematic_trip_ids)}")
-if not problematic_trip_ids.empty:
-    print(problematic_trip_ids.head())
+conn = sqlite3.connect(db_file)
 
-# --- 2. Identiske turer med ulike TRIP_ID ---
-df_no_id = df.drop(columns=["TRIP_ID"])
+df.to_sql("porto", conn, index=False, if_exists="replace")
+print("Data loaded into SQLite table 'porto'")
 
-duplicates_diff_id = df_no_id[df_no_id.duplicated(keep=False)]
+# Taxi ID of top 20 trip takers.
+queries = [
+    #Question 1 - How many taxis, trips, and total GPS points are there? TODO Missing GPS points (!)
+    """
+    SELECT COUNT(DISTINCT TAXI_ID) AS Taxis, COUNT(DISTINCT TRIP_ID) AS Trips
+    FROM porto; 
+    """,
+    #Question 2 - What is the average number of trips per taxi?
+    """
+    SELECT COUNT(*) / COUNT(DISTINCT TAXI_ID) AS Average_Trips_Per_Taxi
+    FROM porto; 
+    """,
+    #Question 3 - List the top 20 taxis with the most trips.
+    """
+    SELECT TAXI_ID, COUNT(*) AS trip_count
+    FROM porto
+    WHERE num_points >= 1
+    GROUP BY TAXI_ID
+    ORDER BY trip_count DESC
+    LIMIT 20;
+    """,
+    #Question 4 - a. What is the most used call type per taxi?
+    """
+    SELECT CALL_TYPE, COUNT(CALL_TYPE)  AS AMOUNT
+    FROM porto 
+    GROUP BY CALL_TYPE;
+    """
+    #Question 4 - b.
+]
 
-print(f"Antall turer som er duplisert men har forskjellig TRIP_ID: {len(duplicates_diff_id)}")
-if not duplicates_diff_id.empty:
-    print(duplicates_diff_id.head())
+for q in queries:
+    print(f"\nRunning query:\n{q.strip()}")
+    result = pd.read_sql(q, conn)
+    print(result)
+
