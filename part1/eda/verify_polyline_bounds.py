@@ -1,8 +1,8 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.stats import gaussian_kde
 import folium
-
 import json
 import math
 import time
@@ -18,6 +18,7 @@ AI Assistance Attribution:
 """
 
 MIN_POLYLINE_POINTS = 8
+MAX_POLYLINE_POINTS = 480  # 2 hours
 
 
 def load_data(filepath="dataset/porto/porto.csv"):
@@ -26,6 +27,35 @@ def load_data(filepath="dataset/porto/porto.csv"):
 
 # found lat and lon: https://latitude.to/map/pt/portugal/cities/porto
 lat, lon = (41.14961, -8.61099)  # center point
+
+# OLD VERSION (SLOWER) - kept for reference - Very slow!
+# def validate_coordinates(polyline_str):
+#     for lon, lat in polyline_str:
+#         if not (
+#             PORTO_BOUNDS["min_lon"] <= lon <= PORTO_BOUNDS["max_lon"]
+#             and PORTO_BOUNDS["min_lat"] <= lat <= PORTO_BOUNDS["max_lat"]
+#         ):
+#             return False
+#     return True
+# def count_invalid_trips():
+#     polyline_col = df["POLYLINE"]
+#     count = 0
+#     for polyline_string in polyline_col:
+#         try:
+#             if pd.isna(polyline_string) or polyline_string == "[]":
+#                 continue
+#             polyline = json.loads(polyline_string)
+#             if not validate_coordinates(polyline):
+#                 count += 1
+#         except:
+#             count += 1
+#     return count
+
+
+# Expected output:
+# - ~6,000-8,000 invalid trips (0.4-0.5%) - up from ~3,500 due to <8 point filter
+# - Most trips stay within 30km of Porto center
+# - Invalid trips include: very short trips (<8 points), airport trips, long-distance rides, or GPS errors
 
 
 def calculate_bounding_box_coord(radius):
@@ -75,10 +105,7 @@ PORTO_BOUNDS = calculate_bounding_box_coord(radius=30)
 print(f"Calculated bounds: {PORTO_BOUNDS}")
 
 
-# POLYLINE VALIDATION - OPTIMIZED VERSION (AI-ASSISTED)
-# takes in [[-8.618643, 41.141412], [-8.618499, 41.141376], [-8.618346, 41.141353]]
-# verifies that each lat and lon for each point is valid
-def validate_single_polyline(polyline_str, min_polyline_points):
+def validate_single_polyline(polyline_str, min_polyline_points, max_polyline_points):
     """
     Validate whether a polyline is usable for analysis.
 
@@ -89,40 +116,52 @@ def validate_single_polyline(polyline_str, min_polyline_points):
 
     A polyline is considered INVALID if:
     1. It's empty, null, or malformed
-    2. It has fewer than 8 GPS points (too short to be meaningful)
-    3. Any GPS coordinates are outside Porto bounds
+    2. It has fewer than min_polyline_points GPS points (too short to be meaningful)
+    3. It has more than max_polyline_points GPS points (too long to be realistic)
+    4. Any GPS coordinates are outside Porto bounds
 
     Args:
         polyline_str: JSON string of GPS coordinates like:
                       "[[-8.618643, 41.141412], [-8.618499, 41.141376], ...]"
+        min_polyline_points: Minimum number of points required
+        max_polyline_points: Maximum number of points allowed
 
     Returns:
-        True if polyline is INVALID (out of bounds or malformed)
-        False if polyline is VALID (all points within bounds)
+        Dictionary with validation results:
+        {
+            'valid': bool,
+            'reason': str,  # 'valid', 'empty', 'too_short', 'too_long', 'out_of_bounds', 'malformed'
+            'point_count': int or None
+        }
     """
     try:
         # Handle empty/null cases
         if pd.isna(polyline_str) or polyline_str == "[]":
-            return True  # Invalid
+            return {"valid": False, "reason": "empty", "point_count": 0}
 
         # Parse JSON
         polyline = json.loads(polyline_str)
         if not polyline:
-            return True
+            return {"valid": False, "reason": "empty", "point_count": 0}
 
         # Convert to numpy array for VECTORIZED operations (much faster than loops)
         # Shape will be (n_points, 2) where each row is [longitude, latitude]
         coords = np.array(polyline, dtype=float)
+        point_count = coords.shape[0]
 
-        # coords.shape[0] is number of points
-        if coords.shape[0] < min_polyline_points:
-            return True  # Invalid - too few points (< 8)
+        # Check minimum points
+        if point_count < min_polyline_points:
+            return {"valid": False, "reason": "too_short", "point_count": point_count}
+
+        # Check maximum points
+        if point_count > max_polyline_points:
+            return {"valid": False, "reason": "too_long", "point_count": point_count}
 
         # Extract all longitudes and latitudes as separate arrays
         lons = coords[:, 0]  # First column: all longitude values
         lats = coords[:, 1]  # Second column: all latitude values
 
-        # This checks ALL points at once (numpy optimized in C, ~100x faster than Python loops)
+        # Check if ALL points are within bounds (numpy optimized in C)
         in_bounds = (
             (lons >= PORTO_BOUNDS["min_lon"])
             & (lons <= PORTO_BOUNDS["max_lon"])
@@ -131,89 +170,78 @@ def validate_single_polyline(polyline_str, min_polyline_points):
         )
 
         if not in_bounds.all():
-            return True  # Invalid - contains out-of-bound coordinates
+            return {
+                "valid": False,
+                "reason": "out_of_bounds",
+                "point_count": point_count,
+            }
 
         # Passed all checks - this is a valid polyline
-        return False
+        return {"valid": True, "reason": "valid", "point_count": point_count}
 
     except Exception:
-        return True  # Treat errors as invalid
+        return {"valid": False, "reason": "malformed", "point_count": None}
 
 
-def count_invalid_trips_single_core(df):
+def count_invalid_trips(df, min_points, max_points):
     """
-    Count how many trips have GPS coordinates outside Porto metropolitan area.
+    Count invalid trips by category with progress tracking.
 
-    AI-assisted optimization:
-    - Added progress indicator for long-running operations
-    - Simplified iteration logic
-    - Better variable naming
-
-    Args:
-        df: DataFrame with POLYLINE column
+    Separates length-based invalidity from geographic invalidity.
 
     Returns:
-        Number of invalid trips
+        Dictionary with counts by reason and missing_data status
     """
-    polyline_col = df["POLYLINE"]
-    missing_data_col = df["MISSING_DATA"]
-    missing_data_true_count = 0
-    missing_data_false_count = 0
-    total = len(polyline_col)
+    polylines = df["POLYLINE"]
+    missing = df["MISSING_DATA"]
 
-    for i, (polyline_str, missing) in enumerate(zip(polyline_col, missing_data_col)):
-        # Progress indicator every 100k rows
+    # Counters for trips with MISSING_DATA=True
+    counts_missing = {
+        "empty": 0,
+        "too_short": 0,
+        "too_long": 0,
+        "out_of_bounds": 0,
+        "malformed": 0,
+        "valid": 0,
+    }
+
+    # Counters for trips with MISSING_DATA=False
+    counts_valid_flag = {
+        "empty": 0,
+        "too_short": 0,
+        "too_long": 0,
+        "out_of_bounds": 0,
+        "malformed": 0,
+        "valid": 0,
+    }
+
+    for i, (poly, miss) in enumerate(zip(polylines, missing)):
         if i % 100000 == 0 and i > 0:
+            total_invalid = (
+                sum(counts_missing.values())
+                + sum(counts_valid_flag.values())
+                - counts_missing["valid"]
+                - counts_valid_flag["valid"]
+            )
             print(
-                f"  Progress: {i:,}/{total:,} ({i/total*100:.1f}%) - Invalid so far: {missing_data_true_count + missing_data_false_count :,}"
+                f"  Progress: {i:,}/{len(polylines):,} ({i / len(polylines) * 100:.1f}%) - Invalid so far: {total_invalid:,}"
             )
 
-        is_invalid = validate_single_polyline(polyline_str, MIN_POLYLINE_POINTS)
+        result = validate_single_polyline(poly, min_points, max_points)
 
-        if is_invalid:
-            if missing:
-                missing_data_true_count += 1
-            else:
-                missing_data_false_count += 1
+        if miss:
+            counts_missing[result["reason"]] += 1
+        else:
+            counts_valid_flag[result["reason"]] += 1
 
     return {
-        0: missing_data_true_count,
-        1: missing_data_false_count,
+        "missing_data_true": counts_missing,
+        "missing_data_false": counts_valid_flag,
     }
 
 
-# OLD VERSION (SLOWER) - kept for reference - Very slow!
-# def validate_coordinates(polyline_str):
-#     for lon, lat in polyline_str:
-#         if not (
-#             PORTO_BOUNDS["min_lon"] <= lon <= PORTO_BOUNDS["max_lon"]
-#             and PORTO_BOUNDS["min_lat"] <= lat <= PORTO_BOUNDS["max_lat"]
-#         ):
-#             return False
-#     return True
-# def count_invalid_trips():
-#     polyline_col = df["POLYLINE"]
-#     count = 0
-#     for polyline_string in polyline_col:
-#         try:
-#             if pd.isna(polyline_string) or polyline_string == "[]":
-#                 continue
-#             polyline = json.loads(polyline_string)
-#             if not validate_coordinates(polyline):
-#                 count += 1
-#         except:
-#             count += 1
-#     return count
-
-
-# Expected output:
-# - ~6,000-8,000 invalid trips (0.4-0.5%) - up from ~3,500 due to <8 point filter
-# - Most trips stay within 30km of Porto center
-# - Invalid trips include: very short trips (<8 points), airport trips, long-distance rides, or GPS errors
-
-
-def plot_trip_lengths(df):
-
+def analyze_trip_statistics(df):
+    """Calculate comprehensive trip length statistics."""
     valid_mask = (
         pd.notna(df["POLYLINE"])
         & (df["POLYLINE"] != "[]")
@@ -221,88 +249,283 @@ def plot_trip_lengths(df):
     )
 
     df["POLYLINE_LENGTH"] = 0
-
     df.loc[valid_mask, "POLYLINE_LENGTH"] = df.loc[valid_mask, "POLYLINE"].apply(
         lambda x: len(json.loads(x))
     )
-    # plt.figure(figsize=(10, 6))
-    # plt.hist(df["POLYLINE_LENGTH"], bins=200, color="black", log=True)
-    # plt.xlabel("Number of GPS points")
-    # plt.ylabel("Frequency")
-    # plt.title("Distribution of trip lengths")
-    # plt.xlim(0, 500)
-    # plt.show()
-    average_length = df["POLYLINE_LENGTH"].mean()
-    median_length = df["POLYLINE_LENGTH"].median()
-    min_length = df["POLYLINE_LENGTH"].min()
-    max_length = df["POLYLINE_LENGTH"].max()
-    std_dev = df["POLYLINE_LENGTH"].std()
 
-    # print(f"Average points per trip: {average_length:.2f}")
-    # print(f"Median points per trip: {median_length}")
-    # print(f"Minimum points per trip: {min_length}")
-    # print(f"Maximum points per trip: {max_length}")
-    # print(f"Standard deviation for trip lengths {std_dev}")
+    lengths = df[df["POLYLINE_LENGTH"] > 0]["POLYLINE_LENGTH"]
 
-    # print("Looking at longer trips:::")
-    # long_trips = df[df["POLYLINE_LENGTH"] > 100]
+    stats = {
+        "mean": lengths.mean(),
+        "median": lengths.median(),
+        "std": lengths.std(),
+        "q1": lengths.quantile(0.25),
+        "q3": lengths.quantile(0.75),
+        "p95": lengths.quantile(0.95),
+        "p99": lengths.quantile(0.99),
+        "min": lengths.min(),
+        "max": lengths.max(),
+    }
 
-    # print(long_trips[["POLYLINE_LENGTH", "MISSING_DATA"]].describe())
-    # print(long_trips.sort_values("POLYLINE_LENGTH", ascending=False).head(10))
+    print("=== Trip Length Statistics ===")
+    print(f"Mean: {stats['mean']:.1f} points ({stats['mean'] * 15 / 60:.1f} min)")
+    print(f"Median: {stats['median']:.1f} points ({stats['median'] * 15 / 60:.1f} min)")
+    print(f"Std Dev: {stats['std']:.1f} points")
+    print(f"Q1: {stats['q1']:.1f} points ({stats['q1'] * 15 / 60:.1f} min)")
+    print(f"Q3: {stats['q3']:.1f} points ({stats['q3'] * 15 / 60:.1f} min)")
+    print(
+        f"95th percentile: {stats['p95']:.1f} points ({stats['p95'] * 15 / 60:.1f} min)"
+    )
+    print(
+        f"99th percentile: {stats['p99']:.1f} points ({stats['p99'] * 15 / 60:.1f} min)"
+    )
 
-    long_trips = df.nlargest(10, "POLYLINE_LENGTH")
+    return stats, lengths, df
 
-    print("Top 10 longest trips:")
-    for index, row in long_trips.iterrows():
+
+def analyze_bounds_impact(lengths, lower=8, upper=480):
+    """Analyze impact of chosen bounds."""
+    print(f"\n=== Bounds Impact Analysis ===")
+    print(f"Lower bound: {lower} points ({lower * 15 / 60:.1f} min)")
+    print(f"Upper bound: {upper} points ({upper * 15 / 60:.0f} min)")
+
+    too_short = (lengths < lower).sum()
+    too_long = (lengths > upper).sum()
+    valid = ((lengths >= lower) & (lengths <= upper)).sum()
+
+    print(
+        f"\nRemoved (too short): {too_short:,} ({too_short / len(lengths) * 100:.2f}%)"
+    )
+    print(f"Removed (too long): {too_long:,} ({too_long / len(lengths) * 100:.2f}%)")
+    print(f"Remaining valid: {valid:,} ({valid / len(lengths) * 100:.2f}%)")
+
+    # Compare thresholds
+    print(f"\n=== Alternative Thresholds ===")
+    for low, high in [(5, 360), (8, 480), (10, 400), (8, 200)]:
+        kept = ((lengths >= low) & (lengths <= high)).sum()
         print(
-            f"Trip {index}: Has {row["POLYLINE_LENGTH"]} points, where the total time is {(row["POLYLINE_LENGTH"] * 15) / 3600} hours"
+            f"[{low:3d}, {high:3d}]: {kept:,} ({kept / len(lengths) * 100:.1f}%) | {low * 15 / 60:.1f}-{high * 15 / 60:.0f} min"
         )
-        print("\n")
-    # for index, row in long_trips.iterrows():
-    #     polyline = json.loads(row["POLYLINE"])
-    #     map_obj = plot_trips_map(polyline)
-    #     map_obj.save(f"trip_{index}.html")
 
 
-def plot_trips_map(polyline):
-    m = folium.Map(location=[41.14961, -8.61099], zoom_start=12)
+def justify_bounds(stats, lengths, lower=8, upper=480):
+    """Provide comprehensive justification for bounds."""
+    print(f"\n{'=' * 70}")
+    print("BOUND JUSTIFICATION")
+    print("=" * 70)
 
-    folium_coords = [[lat, lon] for lon, lat in polyline]
+    print(f"\n1. LOWER BOUND: {lower} points ({lower * 15 / 60:.1f} minutes)")
+    removed_lower = (lengths < lower).sum()
+    print(
+        f"   Removes: {removed_lower:,} trips ({removed_lower / len(lengths) * 100:.2f}%)"
+    )
+    print(f"   Rationale: Too short for meaningful taxi trip")
+    print(f"   - {lower} points × 15 sec = {lower * 15} seconds")
+    print(f"   - Likely GPS errors, cancelled trips, or data artifacts")
 
-    folium.PolyLine(folium_coords, color="blue", weight=2.5, opacity=1).add_to(m)
+    print(f"\n2. UPPER BOUND: {upper} points ({upper * 15 / 60:.0f} minutes)")
+    removed_upper = (lengths > upper).sum()
+    print(
+        f"   Removes: {removed_upper:,} trips ({removed_upper / len(lengths) * 100:.2f}%)"
+    )
+    print(f"   Rationale: Geographic constraints of Porto")
+    print(f"   - Porto metro area: ~30km diameter")
+    print(f"   - Average urban speed: 20-30 km/h with traffic")
+    print(f"   - Maximum reasonable trip: ~2 hours")
+    print(
+        f"   - Statistical context: 99th percentile = {stats['p99']:.0f} points ({stats['p99'] * 15 / 60:.1f} min)"
+    )
 
-    if folium_coords:
-        folium.Marker(
-            folium_coords[0], popup="Start", icon=folium.Icon(color="green")
-        ).add_to(m)
-        folium.Marker(
-            folium_coords[-1], popup="End", icon=folium.Icon(color="red")
-        ).add_to(m)
 
-    return m
+def visualize_distribution(lengths, stats, lower=8, upper=480):
+    """Create comprehensive visualization of trip length distribution.
+    This was mostly made using AI, as the knowledge of plotting within the team was minimal
+    Used: Claud sonnet 4.5
+
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # 1. Full distribution (log scale)
+    axes[0, 0].hist(lengths, bins=100, color="steelblue", edgecolor="black", alpha=0.7)
+    axes[0, 0].set_yscale("log")
+    axes[0, 0].axvline(
+        stats["median"],
+        color="red",
+        linestyle="--",
+        linewidth=2,
+        label=f"Median: {stats['median']:.0f}",
+    )
+    axes[0, 0].axvline(
+        lower, color="orange", linestyle="--", linewidth=2, label=f"Lower: {lower}"
+    )
+    axes[0, 0].axvline(
+        upper, color="darkred", linestyle="--", linewidth=2, label=f"Upper: {upper}"
+    )
+    axes[0, 0].set_xlabel("GPS Points")
+    axes[0, 0].set_ylabel("Frequency (log)")
+    axes[0, 0].set_title("Full Distribution (Log Scale)")
+    axes[0, 0].legend()
+
+    # 2. Zoomed (0-200 points)
+    zoom_data = lengths[lengths <= 200]
+    axes[0, 1].hist(zoom_data, bins=50, color="steelblue", edgecolor="black", alpha=0.7)
+    axes[0, 1].axvline(
+        stats["median"],
+        color="red",
+        linestyle="--",
+        linewidth=2,
+        label=f"Median: {stats['median']:.0f}",
+    )
+    axes[0, 1].axvline(
+        lower, color="orange", linestyle="--", linewidth=2, label=f"Lower: {lower}"
+    )
+    axes[0, 1].set_xlabel("GPS Points")
+    axes[0, 1].set_ylabel("Frequency")
+    axes[0, 1].set_title("Distribution (0-200 points)")
+    axes[0, 1].legend()
+
+    # 3. Histogram with KDE
+    axes[1, 0].hist(
+        lengths, bins=50, density=True, color="lightblue", alpha=0.7, edgecolor="black"
+    )
+
+    # Add KDE curve
+    kde = gaussian_kde(lengths)
+    x_range = np.linspace(lengths.min(), lengths.max(), 100)
+    axes[1, 0].plot(x_range, kde(x_range), color="red", linewidth=2, label="KDE")
+    axes[1, 0].axvline(
+        stats["median"],
+        color="green",
+        linestyle="--",
+        linewidth=2,
+        label=f"Median: {stats['median']:.0f}",
+    )
+    axes[1, 0].axvline(
+        lower, color="orange", linestyle="--", linewidth=2, label=f"Lower: {lower}"
+    )
+    axes[1, 0].axvline(
+        upper, color="darkred", linestyle="--", linewidth=2, label=f"Upper: {upper}"
+    )
+    axes[1, 0].set_xlabel("GPS Points")
+    axes[1, 0].set_ylabel("Density")
+    axes[1, 0].set_title("Histogram with KDE")
+    axes[1, 0].legend()
+
+    # 4. Upper tail
+    upper_tail = lengths[lengths > stats["p95"]]
+    axes[1, 1].hist(upper_tail, bins=30, color="coral", edgecolor="black", alpha=0.7)
+    axes[1, 1].axvline(
+        stats["p99"],
+        color="red",
+        linestyle="--",
+        linewidth=2,
+        label=f"99th: {stats['p99']:.0f}",
+    )
+    axes[1, 1].axvline(
+        upper, color="darkred", linestyle="--", linewidth=2, label=f"Upper: {upper}"
+    )
+    axes[1, 1].set_xlabel("GPS Points")
+    axes[1, 1].set_ylabel("Frequency")
+    axes[1, 1].set_title(f"Upper 5% (>{stats['p95']:.0f} points)")
+    axes[1, 1].legend()
+
+    plt.tight_layout()
+    plt.savefig("trip_length_analysis.png", dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+def print_validation_summary(results):
+    """Print detailed summary of validation results."""
+    print("\n" + "=" * 70)
+    print("VALIDATION SUMMARY")
+    print("=" * 70)
+
+    missing_true = results["missing_data_true"]
+    missing_false = results["missing_data_false"]
+
+    print("\nTrips with MISSING_DATA=True:")
+    print(f"  Empty/Null: {missing_true['empty']:,}")
+    print(f"  Too Short (<{MIN_POLYLINE_POINTS} points): {missing_true['too_short']:,}")
+    print(f"  Too Long (>{MAX_POLYLINE_POINTS} points): {missing_true['too_long']:,}")
+    print(f"  Out of Bounds: {missing_true['out_of_bounds']:,}")
+    print(f"  Malformed: {missing_true['malformed']:,}")
+    print(f"  Valid: {missing_true['valid']:,}")
+    total_missing = sum(missing_true.values())
+    print(f"  TOTAL: {total_missing:,}")
+
+    print("\nTrips with MISSING_DATA=False:")
+    print(f"  Empty/Null: {missing_false['empty']:,}")
+    print(
+        f"  Too Short (<{MIN_POLYLINE_POINTS} points): {missing_false['too_short']:,}"
+    )
+    print(f"  Too Long (>{MAX_POLYLINE_POINTS} points): {missing_false['too_long']:,}")
+    print(f"  Out of Bounds: {missing_false['out_of_bounds']:,}")
+    print(f"  Malformed: {missing_false['malformed']:,}")
+    print(f"  Valid: {missing_false['valid']:,}")
+    total_valid_flag = sum(missing_false.values())
+    print(f"  TOTAL: {total_valid_flag:,}")
+
+    # Overall statistics
+    total_trips = total_missing + total_valid_flag
+    total_invalid = total_trips - missing_true["valid"] - missing_false["valid"]
+
+    print(f"\nOVERALL:")
+    print(f"  Total trips: {total_trips:,}")
+    print(
+        f"  Total valid: {missing_true['valid'] + missing_false['valid']:,} ({(missing_true['valid'] + missing_false['valid'])/total_trips*100:.2f}%)"
+    )
+    print(f"  Total invalid: {total_invalid:,} ({total_invalid/total_trips*100:.2f}%)")
+
+    # Breakdown by invalidity type (excluding valid trips)
+    print(f"\nINVALID TRIP BREAKDOWN:")
+    total_empty = missing_true["empty"] + missing_false["empty"]
+    total_short = missing_true["too_short"] + missing_false["too_short"]
+    total_long = missing_true["too_long"] + missing_false["too_long"]
+    total_bounds = missing_true["out_of_bounds"] + missing_false["out_of_bounds"]
+    total_malformed = missing_true["malformed"] + missing_false["malformed"]
+
+    print(f"  Length-based issues:")
+    print(f"    - Empty/Null: {total_empty:,} ({total_empty/total_trips*100:.2f}%)")
+    print(f"    - Too Short: {total_short:,} ({total_short/total_trips*100:.2f}%)")
+    print(f"    - Too Long: {total_long:,} ({total_long/total_trips*100:.2f}%)")
+    print(f"  Geographic issues:")
+    print(
+        f"    - Out of Bounds: {total_bounds:,} ({total_bounds/total_trips*100:.2f}%)"
+    )
+    print(f"  Data quality issues:")
+    print(
+        f"    - Malformed: {total_malformed:,} ({total_malformed/total_trips*100:.2f}%)"
+    )
 
 
 if __name__ == "__main__":
     df = load_data()
-    # print("\n=== Processing ===")
-    # start = time.time()
-    # invalid_count_dict = count_invalid_trips_single_core(df)
-    # elapsed = time.time() - start
-    # print(
-    #     f"\nFound {invalid_count_dict[0]:,} invalid trips out of {len(df):,} total, where MISSING_DATA = TRUE"
-    # )
-    # print(
-    #     f"\nFound {invalid_count_dict[1]:,} invalid trips out of {len(df):,} total, where MISSING_DATA = FALSE"
-    # )
-    # total_invalid = invalid_count_dict[0] + invalid_count_dict[1]
-    # print(f"Percentage: {total_invalid/len(df)*100:.2f}%")
-    # print(f"Time elapsed: {elapsed:.2f} seconds")
 
-    # # Breakdown (optional - for better insight)
-    # print("\nBreakdown of invalid reasons:")
-    # print("- Empty/null polylines")
-    # print("- Polylines with < 8 points")
-    # print("- Polylines with out-of-bound coordinates")
-    # print("(Note: Some trips may have multiple issues)")
+    print("=" * 70)
+    print("STEP 1: Analyze Trip Lengths")
+    print("=" * 70)
+    stats, lengths, df = analyze_trip_statistics(df)
 
-    plot_trip_lengths(df)
+    print("\n" + "=" * 70)
+    print("STEP 2: Analyze Bounds Impact")
+    print("=" * 70)
+    analyze_bounds_impact(lengths, MIN_POLYLINE_POINTS, MAX_POLYLINE_POINTS)
+
+    print("\n" + "=" * 70)
+    print("STEP 3: Justify Chosen Bounds")
+    print("=" * 70)
+    justify_bounds(stats, lengths, MIN_POLYLINE_POINTS, MAX_POLYLINE_POINTS)
+
+    print("\n" + "=" * 70)
+    print("STEP 4: Visualize Distribution")
+    print("=" * 70)
+    visualize_distribution(lengths, stats, MIN_POLYLINE_POINTS, MAX_POLYLINE_POINTS)
+
+    print("\n" + "=" * 70)
+    print("STEP 5: Validate Polylines with Chosen Bounds")
+    print("=" * 70)
+    start = time.time()
+    results = count_invalid_trips(df, MIN_POLYLINE_POINTS, MAX_POLYLINE_POINTS)
+
+    print_validation_summary(results)
+    print(f"\nValidation completed in {time.time() - start:.2f}s")
