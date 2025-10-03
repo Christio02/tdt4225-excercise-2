@@ -7,8 +7,41 @@ from part1.eda.verify_polyline_bounds import validate_single_polyline
 raw_file = "dataset/porto/porto.csv"
 clean_file = "dataset/porto/porto_cleaned.csv"
 
+df = pd.read_csv(raw_file, nrows=100_000)
+
+
+def handle_duplicates(df):
+    """
+    Handle duplicate TRIP_IDs by:
+    1. Remove the identical duplicate rows with identical TRIP_IDs
+    2. Keep different rows with the same TRIP_ID but give them unique IDs
+    """
+    # Remove identical duplicate rows
+    columns_to_check = [col for col in df.columns if col != "POLYLINE"]
+    df = df.drop_duplicates(subset=columns_to_check, keep="first")
+
+    # Handle different rows with the same TRIP_ID
+    df["TRIP_ID_count"] = df.groupby("TRIP_ID").size()
+    duplicate_trip_ids = df[df["TRIP_ID_count"] > 1].index
+
+    for trip_id in duplicate_trip_ids:
+        mask = df["TRIP_ID"] == trip_id
+        duplicate_rows = df[mask]
+
+        for i, (index, row) in enumerate(duplicate_rows.iterrows()):
+            if i > 0:  # Skip the first occurrence
+                new_trip_id = f"{row['TRIP_ID'] + 10000000000000}"
+                df.loc[index, "TRIP_ID"] = new_trip_id
+
+    df = df.drop("TRIP_ID_count", axis=1)
+
+    return df
+
+
+raw_file = "dataset/porto/porto.csv"
+clean_file = "dataset/porto/porto_cleaned.csv"
+
 # Temporary for testing
-df = pd.read_csv(raw_file, nrows=50000)
 
 
 # Polyline cleaning
@@ -22,10 +55,7 @@ val_results = polyline_col.apply(
 df_clean = df[val_results.apply(lambda x: x["valid"])].copy()
 
 
-# Cleaning
-# df["POLYLINE"] = df["POLYLINE"].apply(ast.literal_eval)
-# df["num_points"] = df["POLYLINE"].apply(len)
-# df = df[df["num_points"] >= 8]
+df_clean = handle_duplicates(df)
 
 
 # remove MISSING_DATA column, as rows affected by this has already been cleaned
