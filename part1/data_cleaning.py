@@ -38,9 +38,6 @@ def handle_duplicates(df):
     return df
 
 
-raw_file = "dataset/porto/porto.csv"
-clean_file = "dataset/porto/porto_cleaned.csv"
-
 # Temporary for testing
 
 
