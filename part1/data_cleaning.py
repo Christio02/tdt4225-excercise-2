@@ -38,9 +38,6 @@ def handle_duplicates(df):
     return df
 
 
-# Temporary for testing
-
-
 # Polyline cleaning
 
 polyline_col = df["POLYLINE"]
@@ -51,8 +48,14 @@ val_results = polyline_col.apply(
 )
 df_clean = df[val_results.apply(lambda x: x["valid"])].copy()
 
+# Handle duplicates
+df_clean = handle_duplicates(df_clean)
 
-df_clean = handle_duplicates(df)
+# Calculate the taxi trip end time, and taxi trip duration
+df_clean["TRIP_DURATION"] = df_clean["num_points"] * 15
+df_clean["END_TIME"] = df_clean["TIMESTAMP"] + df_clean["TRIP_DURATION"]
+
+df_clean.to_csv(clean_file, index=False)
 
 
 # remove MISSING_DATA column, as rows affected by this has already been cleaned
