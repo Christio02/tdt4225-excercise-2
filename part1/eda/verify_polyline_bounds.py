@@ -472,9 +472,11 @@ def print_validation_summary(results):
     print(f"\nOVERALL:")
     print(f"  Total trips: {total_trips:,}")
     print(
-        f"  Total valid: {missing_true['valid'] + missing_false['valid']:,} ({(missing_true['valid'] + missing_false['valid'])/total_trips*100:.2f}%)"
+        f"  Total valid: {missing_true['valid'] + missing_false['valid']:,} ({(missing_true['valid'] + missing_false['valid']) / total_trips * 100:.2f}%)"
     )
-    print(f"  Total invalid: {total_invalid:,} ({total_invalid/total_trips*100:.2f}%)")
+    print(
+        f"  Total invalid: {total_invalid:,} ({total_invalid / total_trips * 100:.2f}%)"
+    )
 
     # Breakdown by invalidity type (excluding valid trips)
     print(f"\nINVALID TRIP BREAKDOWN:")
@@ -485,16 +487,16 @@ def print_validation_summary(results):
     total_malformed = missing_true["malformed"] + missing_false["malformed"]
 
     print(f"  Length-based issues:")
-    print(f"    - Empty/Null: {total_empty:,} ({total_empty/total_trips*100:.2f}%)")
-    print(f"    - Too Short: {total_short:,} ({total_short/total_trips*100:.2f}%)")
-    print(f"    - Too Long: {total_long:,} ({total_long/total_trips*100:.2f}%)")
-    print(f"  Geographic issues:")
+    print(f"    - Empty/Null: {total_empty:,} ({total_empty / total_trips * 100:.2f}%)")
+    print(f"    - Too Short: {total_short:,} ({total_short / total_trips * 100:.2f}%)")
+    print(f"    - Too Long: {total_long:,} ({total_long / total_trips * 100:.2f}%)")
+    print("Geographic issues:")
     print(
-        f"    - Out of Bounds: {total_bounds:,} ({total_bounds/total_trips*100:.2f}%)"
+        f"    - Out of Bounds: {total_bounds:,} ({total_bounds / total_trips * 100:.2f}%)"
     )
-    print(f"  Data quality issues:")
+    print("Data quality issues:")
     print(
-        f"    - Malformed: {total_malformed:,} ({total_malformed/total_trips*100:.2f}%)"
+        f"    - Malformed: {total_malformed:,} ({total_malformed / total_trips * 100:.2f}%)"
     )
 
 
