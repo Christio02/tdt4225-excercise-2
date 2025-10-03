@@ -498,6 +498,8 @@ def print_validation_summary(results):
     print(
         f"    - Malformed: {total_malformed:,} ({total_malformed / total_trips * 100:.2f}%)"
     )
+    
+
 
 
 if __name__ == "__main__":
